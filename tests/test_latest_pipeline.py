@@ -114,13 +114,12 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
 def test_public_writer_materializes_source_grounded_rules_with_configured_names():
     with latest.identity_scope({'ai_name': 'Atlas', 'user_name': 'Lin'}):
         rules = latest.materialize_agent_rules('event_writer')
-    assert 'Atlas 在回复中对Lin的话作出的展开' in rules
-    assert '最小完整语义单位' in rules and '局部回应不能改变前句' in rules
-    assert '不额外补出理解、判断、解释等动作' in rules
-    assert '不把某一种归属句式当成模板' in rules
-    assert '原文停留在“想、打算、建议' in rules
-    assert '反例三' in rules and '台灯' in rules
-    assert '我把这句话理解成' not in rules
+    assert '我是 Atlas，Lin是她' in rules
+    assert '纠正后直接写最终结论' in rules
+    assert '不按相隔多久机械补时间' in rules
+    assert '不能提供当前的新行动、感受或结果' in rules
+    assert '不能把我的解释算成她的看法' in rules
+    assert '不能只用最新一段覆盖旧经历' in rules
     assert 'Haven' not in rules and '小雨' not in rules
 
 
@@ -277,7 +276,7 @@ def test_identity_rendering_never_rewrites_source_words(settings):
     with latest.identity_scope(names):
         prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':original}])
     assert original in prompt and 'Nori' in prompt and 'Atlas' in prompt and '{ai_name}' not in prompt
-    assert 'Nori把台灯送修' in prompt
+    assert '我是 Atlas，Nori是她' in prompt
 
 
 def test_configured_names_are_literal_values_not_recursive_templates(settings):
@@ -291,7 +290,7 @@ def test_configured_names_are_literal_values_not_recursive_templates(settings):
     # Freshly loaded Writer examples use the current saved instance names.
     save_settings(settings.database, {'identity':{'user_name':'NewReader','ai_name':'NewGuide'}})
     rules=p.rules('event_writer',settings.database)
-    assert 'NewReader把台灯送修' in rules and 'NewGuide' in rules
+    assert '我是 NewGuide，NewReader是她' in rules
 
 
 def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeypatch):
@@ -302,9 +301,12 @@ def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeyp
     save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],'assignments':{r:'local' for r in p.ROLES}})
     async def complete(model,payload):
         with Store(settings.database,read_only=True) as store:request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
-        if request['role']=='event_curator':
+        if request.get('transcription_only'):
             assert request['images'][0]['evidence_role']=='stable'
             assert payload['messages'][1]['content'][1]['image_url']['url']==uri
+            return {'choices':[{'message':{'content':json.dumps({'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]})}}]}
+        if request['role']=='event_curator':
+            assert request['images']==[] and request['pretranscribed']
         if request['role']=='event_writer':
             assert request['images']==[]
             assert request['curator_image_transcriptions'][0]['evidence_role']=='owned'
@@ -373,3 +375,142 @@ def test_transcribe_component_prefers_frozen_exact_receipt(settings,monkeypatch)
     used=asyncio.run(p.transcribe_component(settings.database,{'id':'frozen'},component,0,None))
     assert used is True
     assert component['curator_image_transcriptions']==[transcription]
+
+
+def test_failed_image_budget_survives_new_batches_and_manual_retry(settings):
+    from serein.image_transcription import image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    raw_archive(settings).ingest([
+        {'source_event_id':'bad-u','session_id':'bad','role':'user','text':'Read this image','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri}]}},
+        {'source_event_id':'bad-a','session_id':'bad','role':'assistant','text':'We discussed the image','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    calls=[]
+    async def failing(role,request):
+        if request.get('transcription_only'):
+            calls.append(request['images'][0]['sha256'])
+            raise ValueError('synthetic image failure')
+        return output_for(role,request)
+    for _ in range(2):
+        with pytest.raises(ValueError,match='synthetic image failure'):
+            asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))
+    result=asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))
+    assert len(calls)==3 and image_failures(settings.database,calls[0])==3
+    assert result['events']==0 and result['deferred']==2
+    assert result['image_deferrals'][0]['status']=='failed'
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0]==0
+        assert store.conn.execute('SELECT count(*) FROM pipeline_image_holds').fetchone()[0]==2
+        payload=json.loads(store.conn.execute('SELECT image_transcription_json FROM raw_events WHERE id=1').fetchone()[0])
+        assert payload['status']=='failed' and payload['items']==[]
+        assert 'unreadable' not in payload['failed_images'][0]
+    ingest(settings)
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))['events']==1
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))['status']=='current'
+    assert len(calls)==3
+    from fastapi.testclient import TestClient
+    from serein.api.http import create_app
+    client=TestClient(create_app(settings,token='test',live=True),headers={'Authorization':'Bearer test'})
+    assert client.get('/v1/pipeline/status').json()['failed_images'][0]['failures']==3
+    unauthenticated=TestClient(create_app(settings,token='test',live=True))
+    assert unauthenticated.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).status_code==401
+    from serein.work_tasks import enqueue, pause
+    enqueue(settings.database,'pipeline')
+    assert client.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).json()['status']=='busy'
+    assert image_failures(settings.database,calls[0])==3
+    pause(settings.database,'pipeline')
+    assert client.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).status_code==200
+    async def success(role,request):
+        if request.get('transcription_only'):
+            return {'image_transcriptions':[{'input_image':1,'text':'Actual image text','unreadable':False}]}
+        return output_for(role,request)
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=success))['events']==1
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0]==4
+        assert store.conn.execute('SELECT count(*) FROM pipeline_image_holds').fetchone()[0]==0
+    assert client.get('/v1/pipeline/status').json()['failed_images']==[]
+
+
+def test_image_holds_keep_independent_proposals_and_shared_bridge_pending(settings):
+    from serein.image_transcription import apply_image_holds
+    p.initialize(settings.database)
+    failed={'source_message_id':1,'position':1,'sha256':'a'*64,'status':'failed','failures':3}
+    component={'messages':[{'id':1,'role':'user'},{'id':2,'role':'assistant'},
+                           {'id':3,'role':'user'},{'id':4,'role':'assistant'}],
+               'memberships':[{'source_message_ids':[i]} for i in range(1,5)],
+               'base_event_candidates':[],'unavailable_images':[failed]}
+    event=lambda ids:{'source_message_ids':ids,'base_event_ids':[]}
+    plan={'events':[event([1,2]),event([3,4])],
+          'skip_source_message_ids':[],'defer_source_message_ids':[]}
+    result=apply_image_holds(settings.database,plan,component)
+    assert result['events']==[event([3,4])] and result['defer_source_message_ids']==[1,2]
+    plan['events'][1]=event([2,3,4])
+    result=apply_image_holds(settings.database,plan,component)
+    assert result['events']==[] and result['defer_source_message_ids']==[1,2,3,4]
+    context={**component,'unavailable_images':[{**failed,'source_message_id':99}]}
+    result=apply_image_holds(settings.database,plan,context,held_sources={'a'*64:{1,2}})
+    assert result['events']==[] and result['defer_source_message_ids']==[1,2,3,4]
+    ingest(settings);ingest(settings,2)
+    component['unavailable_images'].append({**failed,'source_message_id':3,'sha256':'b'*64})
+    plan['events']=[event([1,2]),event([3,4])]
+    apply_image_holds(settings.database,plan,component)
+    with Store(settings.database,read_only=True) as store:
+        assert [tuple(row) for row in store.conn.execute('SELECT raw_id,sha256 FROM pipeline_image_holds ORDER BY raw_id')]==[
+            (1,'a'*64),(2,'a'*64),(3,'b'*64),(4,'b'*64)]
+
+
+def test_image_failure_keeps_successful_sibling_receipt(settings):
+    from serein.image_transcription import reusable_transcriptions, image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    import base64
+    other='data:image/png;base64,'+base64.b64encode(base64.b64decode(uri.split(',')[1])+b'different bytes').decode()
+    raw_archive(settings).ingest([
+        {'source_event_id':'multi-u','session_id':'multi','role':'user','text':'Two images','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri},{'kind':'image','url':other}]}},
+        {'source_event_id':'multi-a','session_id':'multi','role':'assistant','text':'Discussed both','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    calls={1:0,2:0}
+    async def runner(role,request):
+        if request.get('transcription_only'):
+            position=request['images'][0]['position'];calls[position]+=1
+            if position==1:raise ValueError('bad image')
+            return {'image_transcriptions':[{'input_image':1,'text':'Good sibling','unreadable':False}]}
+        return output_for(role,request)
+    for _ in range(2):
+        with pytest.raises(ValueError,match='bad image'):
+            asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
+    result=asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
+    assert calls=={1:3,2:1} and result['events']==0
+    with Store(settings.database,read_only=True) as store:
+        payload=json.loads(store.conn.execute('SELECT image_transcription_json FROM raw_events WHERE id=1').fetchone()[0])
+    assert payload['items'][0]['text']=='Good sibling'
+    assert image_failures(settings.database,payload['items'][0]['sha256'])==0
+    assert payload['failed_images'][0]['sha256']!=payload['items'][0]['sha256']
+
+
+def test_image_api_counts_each_failed_request_and_waiting_agent_does_not(settings,monkeypatch):
+    from serein.image_transcription import image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    raw_archive(settings).ingest([
+        {'source_event_id':'api-u','session_id':'api','role':'user','text':'Image','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri}]}},
+        {'source_event_id':'api-a','session_id':'api','role':'assistant','text':'Reply','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    p.submit(settings.database,task['job_id'],output_for('track_router',task['request']))
+    waiting=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert waiting['request']['transcription_only']
+    assert waiting['request']['execution']['task']=='image_transcription'
+    sha=waiting['request']['images'][0]['sha256']
+    assert image_failures(settings.database,sha)==0
+    save_settings(settings.database,{'pipeline':{'execution_mode':'api'},'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
+                                     'assignments':{r:'local' for r in p.ROLES}})
+    calls=[]
+    async def complete(model,payload):
+        with Store(settings.database,read_only=True) as store:
+            request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+        if request.get('transcription_only'):
+            calls.append(1)
+            raise TimeoutError('synthetic timeout')
+        return {'choices':[{'message':{'content':json.dumps(output_for(request['role'],request))}}]}
+    monkeypatch.setattr('serein.model_runtime.complete',complete)
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert len(calls)==3 and image_failures(settings.database,sha)==3
+    assert result['events']==0 and result['deferred']==2
