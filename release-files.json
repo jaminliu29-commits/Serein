@@ -10,6 +10,8 @@
   "deploy/Gateway.Dockerfile",
   "deploy/compose.yaml",
   "docs/automatic-events.md",
+  "docs/deployment-guide.md",
+  "docs/troubleshooting.md",
   "docs/memory-storage.md",
   "docs/companion.md",
   "docs/entity-tagging.md",
@@ -52,6 +54,7 @@
   "examples/route-examples.json",
   "pyproject.toml",
   "release-files.json",
+  "scripts/doctor.py",
   "scripts/event_agent_mcp.py",
   "scripts/install_shortcut.py",
   "scripts/local_runtime.py",
@@ -537,5 +540,7 @@
   "web/src/pages/ResumePage.jsx",
   "web/src/pages/resume-page.css",
   "web/src/utils/resumePages.js",
-  "web/tests/resume-pages.test.mjs"
+  "web/tests/resume-pages.test.mjs",
+  "src/serein/adapters/token_window.py",
+  "tests/test_token_windows.py"
 ]
